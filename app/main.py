@@ -6,10 +6,12 @@ import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .db import Database
-from .errors import DomainError
+from .errors import DomainError, PayloadTooLargeError
 from .groups import (
     AGE_BANDS,
     COST_PER_PUBLICATION,
@@ -18,6 +20,7 @@ from .groups import (
     SENSITIVITY,
     STREETS,
 )
+from .import_parser import IMPORT_MAX_BODY_BYTES, parse_import_payload
 from .schemas import (
     BudgetResponse,
     HealthResponse,
@@ -42,10 +45,30 @@ def _total_budget_from_env() -> int:
     return value
 
 
+def _inline_json_schema(model: type[BaseModel]) -> dict:
+    """Return the model's JSON schema with local ``$defs`` refs inlined."""
+
+    schema = model.model_json_schema()
+    defs = schema.pop("$defs", {})
+
+    def resolve(node: object) -> object:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                return resolve(defs[ref.rsplit("/", 1)[-1]])
+            return {key: resolve(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [resolve(item) for item in node]
+        return node
+
+    return resolve(schema)  # type: ignore[return-value]
+
+
 def create_app(
     database_path: str | None = None,
     total_budget: int | None = None,
     publish_before_commit: BeforeCommitHook | None = None,
+    import_before_commit: BeforeCommitHook | None = None,
 ) -> FastAPI:
     db_path = database_path or os.environ.get("DATABASE_PATH", "/data/fevers.db")
     budget = _total_budget_from_env() if total_budget is None else total_budget
@@ -53,7 +76,10 @@ def create_app(
     database = Database(db_path)
     database.initialize(budget)
     service = ReleaseService(
-        database, total_budget=budget, before_commit=publish_before_commit
+        database,
+        total_budget=budget,
+        before_commit=publish_before_commit,
+        import_before_commit=import_before_commit,
     )
 
     app = FastAPI(
@@ -92,9 +118,40 @@ def create_app(
             "cost_per_publication": COST_PER_PUBLICATION,
         }
 
-    @app.post("/v1/imports", response_model=ImportResponse, status_code=201)
-    def create_import(payload: ImportRequest) -> ImportResponse:
-        result = service.import_week(payload.week, payload.records)
+    @app.post(
+        "/v1/imports",
+        response_model=ImportResponse,
+        status_code=201,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": _inline_json_schema(ImportRequest)
+                    }
+                },
+            }
+        },
+    )
+    async def create_import(request: Request) -> ImportResponse:
+        # The body is parsed as a stream (never buffered whole, never turned
+        # into 200k model instances) so a full week batch fits in the small
+        # address space; raw patient identifiers are used only for in-memory
+        # de-duplication during the parse and are discarded with it.
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_size = int(declared)
+            except ValueError:
+                declared_size = -1
+            if declared_size > IMPORT_MAX_BODY_BYTES:
+                raise PayloadTooLargeError(
+                    f"the import body exceeds the {IMPORT_MAX_BODY_BYTES}-byte limit"
+                )
+        week, counts, record_count = await parse_import_payload(request.stream())
+        result = await run_in_threadpool(
+            service.import_week, week, counts, record_count
+        )
         return ImportResponse(**result)
 
     @app.get("/v1/imports/{version}", response_model=ImportResponse)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Annotated
+from typing import Annotated, Final
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -14,9 +14,32 @@ _WEEK_PATTERN = re.compile(r"^(\d{4})-W(\d{2})$")
 _STREET_SET = frozenset(STREETS)
 _AGE_BAND_SET = frozenset(AGE_BANDS)
 
+# Import contract limits, shared by the Pydantic models below (API docs) and
+# the streaming parser in `app.import_parser` (enforcement).
+IMPORT_MAX_RECORDS: Final = 200_000
+IMPORT_MIN_RECORDS: Final = 1
+PATIENT_ID_MAX_LENGTH: Final = 200
+
+
+def validate_iso_week(value: str) -> str:
+    """Return ``value`` unchanged if it is a real ISO week (``YYYY-Www``)."""
+
+    match = _WEEK_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError("week must use the ISO form YYYY-Www, e.g. 2026-W20")
+    year, week = int(match.group(1)), int(match.group(2))
+    try:
+        date.fromisocalendar(year, week, 1)
+    except ValueError as exc:
+        raise ValueError("week is not a valid ISO week") from exc
+    return value
+
+
 PatientId = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+    StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=PATIENT_ID_MAX_LENGTH
+    ),
 ]
 
 
@@ -49,23 +72,25 @@ class PatientRecordIn(BaseModel):
 
 
 class ImportRequest(BaseModel):
+    """Documented shape of the import body.
+
+    The endpoint itself parses the body as a stream (see
+    ``app.import_parser``) so a full 200k-record batch fits in a small
+    address space; this model keeps the contract visible in OpenAPI and
+    shares its limits with the parser.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     week: str
-    records: list[PatientRecordIn] = Field(min_length=1, max_length=200_000)
+    records: list[PatientRecordIn] = Field(
+        min_length=IMPORT_MIN_RECORDS, max_length=IMPORT_MAX_RECORDS
+    )
 
     @field_validator("week")
     @classmethod
     def _iso_week(cls, value: str) -> str:
-        match = _WEEK_PATTERN.fullmatch(value)
-        if match is None:
-            raise ValueError("week must use the ISO form YYYY-Www, e.g. 2026-W20")
-        year, week = int(match.group(1)), int(match.group(2))
-        try:
-            date.fromisocalendar(year, week, 1)
-        except ValueError as exc:
-            raise ValueError("week is not a valid ISO week") from exc
-        return value
+        return validate_iso_week(value)
 
 
 class ImportResponse(BaseModel):

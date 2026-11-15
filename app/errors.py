@@ -19,6 +19,20 @@ class DuplicatePatientError(DomainError):
     code = "duplicate_patient_in_week"
 
 
+class InvalidImportPayloadError(DomainError):
+    """The streamed import body is malformed or fails schema validation."""
+
+    status_code = 422
+    code = "invalid_import_payload"
+
+
+class PayloadTooLargeError(DomainError):
+    """The import body exceeds the byte cap and is rejected unread."""
+
+    status_code = 413
+    code = "payload_too_large"
+
+
 class WeekAlreadyImportedError(DomainError):
     status_code = 409
     code = "week_already_imported"

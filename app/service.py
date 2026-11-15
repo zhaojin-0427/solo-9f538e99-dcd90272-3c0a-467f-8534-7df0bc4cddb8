@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 import sqlite3
-from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Callable, Iterable
+from typing import Callable
 
 from .db import Database
 from .errors import (
     BudgetExhaustedError,
-    DuplicatePatientError,
     ImportNotFoundError,
     PublicationNotFoundError,
     StorageError,
     WeekAlreadyImportedError,
 )
-from .groups import AGE_BANDS, COST_PER_PUBLICATION, EPSILON, STREETS
+from .groups import AGE_BANDS, COST_PER_PUBLICATION, EPSILON, STREET_AGE_CELLS, STREETS
 from .noise import noisy_count
-from .schemas import CountCell, PatientRecordIn
+from .schemas import CountCell
 
-# Optional test hook invoked after all publication rows are written but before
+# Optional test hook invoked after all rows of a write are written but before
 # COMMIT, letting tests prove that a failing write leaves nothing behind.
 BeforeCommitHook = Callable[[int], None]
+
+_CELL_SET = frozenset(STREET_AGE_CELLS)
 
 
 def _now() -> str:
@@ -43,6 +44,7 @@ class ReleaseService:
         cost_per_publication: int = COST_PER_PUBLICATION,
         epsilon: float = EPSILON,
         before_commit: BeforeCommitHook | None = None,
+        import_before_commit: BeforeCommitHook | None = None,
     ) -> None:
         if total_budget < 0:
             raise ValueError("total_budget must be non-negative")
@@ -55,35 +57,35 @@ class ReleaseService:
         self.cost_per_publication = cost_per_publication
         self.epsilon = epsilon
         self._before_commit = before_commit
+        self._import_before_commit = import_before_commit
 
     # ------------------------------------------------------------------ #
     # Imports
     # ------------------------------------------------------------------ #
-    def import_week(self, week: str, records: Iterable[PatientRecordIn]) -> dict:
-        """Validate a week's records atomically and store an immutable version.
+    def import_week(
+        self,
+        week: str,
+        counts: Mapping[tuple[str, str], int],
+        record_count: int,
+    ) -> dict:
+        """Store a validated, aggregated week as one immutable version.
 
-        If any de-identified patient number occurs more than once in the batch,
-        the entire batch is rejected and nothing is written.  Raw identifiers
-        are never persisted and are never echoed in error messages.
+        The HTTP layer has already streamed, validated and de-duplicated the
+        batch; raw patient identifiers never reach this layer and are never
+        persisted.  The version row and all 25 fixed street/age-band cells
+        commit in a single transaction, so a failed write leaves neither the
+        week version nor partial group truth behind.
         """
 
-        counts: dict[tuple[str, str], int] = defaultdict(int)
-        seen: set[str] = set()
-        record_count = 0
-
-        for record in records:
-            if record.patient_id in seen:
-                raise DuplicatePatientError(
-                    "the same de-identified patient number appears more than "
-                    "once in this week; the entire batch was rejected"
-                )
-            seen.add(record.patient_id)
-            counts[(record.street, record.age_band)] += 1
-            record_count += 1
-
-        if record_count == 0:
-            # Unreachable through the HTTP schema; keep the service honest.
-            raise ValueError("a week import must contain at least one record")
+        total = 0
+        for cell, count in counts.items():
+            if cell not in _CELL_SET:
+                raise ValueError(f"unknown street/age-band cell {cell!r}")
+            if count <= 0:
+                raise ValueError("cell counts must be positive")
+            total += count
+        if record_count <= 0 or total != record_count:
+            raise ValueError("record_count does not match the aggregated cells")
 
         try:
             with self.db.transaction() as conn:
@@ -113,6 +115,9 @@ class ReleaseService:
                         for age_band in AGE_BANDS
                     ],
                 )
+
+                if self._import_before_commit is not None:
+                    self._import_before_commit(version)
         except sqlite3.Error as exc:
             raise StorageError(
                 "the import could not be stored; no data was written"
