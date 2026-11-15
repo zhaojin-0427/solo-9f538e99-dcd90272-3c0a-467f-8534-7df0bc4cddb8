@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: fever-clinic-dp:local
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/fevers.db
+      PRIVACY_TOTAL_BUDGET: "3"
+    volumes:
+      - fever-data:/data
+    restart: unless-stopped
+
+volumes:
+  fever-data:
